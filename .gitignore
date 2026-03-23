@@ -1,7 +1,10 @@
+vscode/
 __pycache__/
+
 
 .venv/
 .env
 
-data/processed/
-data/raw/
+data/processed/*
+data/raw/*
+

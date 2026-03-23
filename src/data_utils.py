@@ -172,7 +172,7 @@ def build_dataset(
     for col, k in zip(CAT_COLS, cardinalities):
         print(f"         {col:<20s}  K={k}")
 
-    # 6. Meta — everything needed to reconstruct or inverse-transform
+    # 6. Meta - everything needed to reconstruct or inverse-transform
     meta = {
         'num_cols':      NUM_COLS,
         'cat_cols':      CAT_COLS,
@@ -236,3 +236,28 @@ def decode_sample(x_num: np.ndarray, x_cat: np.ndarray, meta: dict) -> pd.DataFr
     cat_df = pd.DataFrame(cat_decoded)
 
     return pd.concat([num_df, cat_df], axis=1)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

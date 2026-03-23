@@ -1,2 +1,18 @@
 # discrete-diffusion-tabular
-Benchmarking discrete diffusion models (D3PM, SEDD, MDLM, DFM) against TabDDPM for categorical tabular data synthesis on UCI datasets.
+Per-feature noise schedules for TabDDPM derived from mutual information, improving synthesis quality for high-cardinality categorical features.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
