@@ -1,10 +1,16 @@
-vscode/
+.vscode/
 __pycache__/
-
+*.pyc
+*.Zone.Identifier
 
 .venv/
 .env
+.claude/
 
 data/processed/*
 data/raw/*
 
+outputs/checkpoints/*
+outputs/samples/*
+CLAUDE.md
+reference/

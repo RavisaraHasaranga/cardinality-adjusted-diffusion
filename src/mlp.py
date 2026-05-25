@@ -8,8 +8,8 @@ Architecture (from Kotelnikov et al., 2023):
     Body:   ResBlock(Linear → SiLU → Dropout → Linear + skip) × N_layers
     Output: [ε_pred (n_num dims), x̂₀_cat_1 (K_1 dims), ..., x̂₀_cat_C (K_C dims)]
 
-This module is IDENTICAL for the shared-schedule baseline and the
-cardinality-adjusted variant.  Only the noise schedule changes —
+This module is identical for the shared-schedule baseline and the
+cardinality-adjusted variant.  Only the noise schedule changes -
 the backbone never sees or needs the schedule directly.
 
 Design notes:
@@ -59,10 +59,14 @@ class SinusoidalTimestepEmbedding(nn.Module):
         """
         device = t.device
         half = self.dim // 2
+        # Compute log-spaced frequencies: low-index dims capture coarse
+        # (slow-varying) timestep info, high-index dims capture fine detail
         freqs = torch.exp(
             -math.log(10000.0) * torch.arange(half, device=device) / half
         )
+        # Outer product: each timestep multiplied by each frequency
         args = t[:, None].float() * freqs[None, :]
+        # Interleave sin and cos to fill the full embedding dimension
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
@@ -78,7 +82,7 @@ class ResMLPBlock(nn.Module):
         h = Dropout(SiLU(Linear(h)))
         out = x + h                 ← skip connection
 
-    Using SiLU (Swish) rather than ReLU — smoother gradients, standard
+    Using SiLU (Swish) rather than ReLU - smoother gradients, standard
     in modern diffusion MLPs.
     """
 
@@ -86,7 +90,7 @@ class ResMLPBlock(nn.Module):
         super().__init__()
         self.linear1   = nn.Linear(hidden_dim, hidden_dim)
         self.linear2   = nn.Linear(hidden_dim, hidden_dim)
-        self.cond_proj = nn.Linear(cond_dim, hidden_dim)
+        self.cond_proj = nn.Linear(cond_dim, hidden_dim)  # projects conditioning to hidden dim
         self.act       = nn.SiLU()
         self.dropout   = nn.Dropout(dropout)
 
@@ -94,14 +98,16 @@ class ResMLPBlock(nn.Module):
         """
         Args:
             x:    (B, hidden_dim)
-            cond: (B, cond_dim)  — combined timestep + label embedding
+            cond: (B, cond_dim)  - combined timestep + label embedding
         Returns:
             (B, hidden_dim)
         """
         h = self.act(self.linear1(x))
+        # Additive conditioning injection: timestep + class info modulates
+        # the hidden representation, telling the network the noise level
         h = h + self.cond_proj(cond)
         h = self.dropout(self.act(self.linear2(h)))
-        return x + h
+        return x + h  # residual skip connection for stable gradient flow
 
 
 # Full model ---------------------------------------
@@ -143,9 +149,13 @@ class TabDDPMMLP(nn.Module):
         self.n_num = n_num
         self.cardinalities = cardinalities
         self.n_cat = len(cardinalities)
+        # Categorical input dimension is sum(K_i) because we use concatenated
+        # one-hot vectors, not raw integer indices
         self.cat_input_dim = sum(cardinalities)
 
-        # Conditioning
+        # --- Conditioning pathway ---
+        # Sinusoidal embedding followed by a small MLP to give the model
+        # a learnable, expressive representation of the current noise level
         self.t_embed = nn.Sequential(
             SinusoidalTimestepEmbedding(t_emb_dim),
             nn.Linear(t_emb_dim, t_emb_dim),
@@ -153,20 +163,25 @@ class TabDDPMMLP(nn.Module):
             nn.Linear(t_emb_dim, t_emb_dim),
         )
 
+        # Learned class embedding (for class-conditional generation)
         self.y_embed = nn.Embedding(n_classes, t_emb_dim)
 
-        # Input projection
+        # --- Input projection ---
+        # Maps concatenated [x_num_noisy, x_cat_onehot_noisy] into hidden dim
         input_dim = n_num + self.cat_input_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
-        # Residual backbone
+        # --- Residual backbone ---
         self.blocks = nn.ModuleList([
             ResMLPBlock(hidden_dim, t_emb_dim, dropout)
             for _ in range(n_layers)
         ])
 
-        # Output heads
+        # --- Dual output heads ---
+        # Numerical head: predicts noise epsilon (Gaussian diffusion, eps-parameterisation)
         self.num_head = nn.Linear(hidden_dim, n_num) if n_num > 0 else None
+        # Categorical heads: one per feature, predicts clean x_0 logits
+        # (multinomial diffusion, x_0-parameterisation). Each outputs K_i logits.
         self.cat_heads = nn.ModuleList([
             nn.Linear(hidden_dim, K_i) for K_i in cardinalities
         ])
@@ -174,7 +189,12 @@ class TabDDPMMLP(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier uniform for linears, zeros for output head biases only."""
+        """Xavier uniform for linears, zeros for output head biases only.
+
+        Zero-initialising output biases means the model starts by predicting
+        zero noise (numericals) and uniform logits (categoricals), which
+        gives a stable, low-variance starting point for training.
+        """
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -183,8 +203,8 @@ class TabDDPMMLP(nn.Module):
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
 
-        # Zero-init output head biases only — zeroing weights would collapse
-        # gradients at step 0 since the Jacobian would be zero.
+        # Only zero the output biases, not weights. Zeroing both would make
+        # the Jacobian zero at step 0, collapsing early gradients.
         if self.num_head is not None:
             nn.init.zeros_(self.num_head.bias)
         for head in self.cat_heads:
@@ -209,22 +229,26 @@ class TabDDPMMLP(nn.Module):
             cat_logits: list of C tensors   [(B, K_1), (B, K_2), ..., (B, K_C)]
                         predicted x₀ logits for each categorical feature
         """
-        t_emb = self.t_embed(t)
-        y_emb = self.y_embed(y)
-        cond  = t_emb + y_emb
+        # Build conditioning vector: sum of timestep and class embeddings
+        t_emb = self.t_embed(t)       # (B, t_emb_dim)
+        y_emb = self.y_embed(y)       # (B, t_emb_dim)
+        cond  = t_emb + y_emb         # additive fusion of time + class info
 
+        # Concatenate noisy numerical features with one-hot noisy categoricals
         if self.n_num > 0:
             x = torch.cat([x_num_noisy, x_cat_onehot_noisy], dim=1)
         else:
             x = x_cat_onehot_noisy
 
+        # Project to hidden dim, then pass through residual blocks
         h = self.input_proj(x)
 
         for block in self.blocks:
             h = block(h, cond)
 
+        # Dual output: epsilon for numericals, x_0 logits for categoricals
         eps_pred   = self.num_head(h) if self.num_head is not None else None
-        cat_logits = [head(h) for head in self.cat_heads]
+        cat_logits = [head(h) for head in self.cat_heads]  # list of (B, K_i)
 
         return eps_pred, cat_logits
 
@@ -236,8 +260,12 @@ def indices_to_onehot(x_cat: torch.Tensor, cardinalities: List[int]) -> torch.Te
     """
     Convert integer-encoded categoricals to concatenated one-hot vectors.
 
+    This bridges data_utils (which stores categoricals as integers) and the MLP
+    (which expects one-hot input). Called by the diffusion modules before
+    feeding noisy categoricals into the network.
+
     Args:
-        x_cat:         (B, C)  integer indices, column i ∈ [0, K_i)
+        x_cat:         (B, C)  integer indices, column i in [0, K_i)
         cardinalities: list of K_i per feature
 
     Returns:
@@ -245,20 +273,22 @@ def indices_to_onehot(x_cat: torch.Tensor, cardinalities: List[int]) -> torch.Te
     """
     parts = []
     for i, K_i in enumerate(cardinalities):
+        # Create a zeros tensor and place a 1.0 at the index for each sample
         one_hot = torch.zeros(x_cat.size(0), K_i, device=x_cat.device)
         one_hot.scatter_(1, x_cat[:, i:i+1].long(), 1.0)
         parts.append(one_hot)
+    # Concatenate all features into one long vector per sample
     return torch.cat(parts, dim=1)
 
 
-# Sanity check ---------------------------------------
-
+# Sanity check: python -m src.mlp
 
 if __name__ == "__main__":
     import sys
     sys.path.append(".")
     from src.data_utils import load_meta
 
+    # Load real cardinalities from the preprocessed dataset
     meta          = load_meta()
     n_num         = meta['n_num']
     cardinalities = meta['cardinalities']
@@ -278,8 +308,10 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[mlp] Total parameters: {n_params:,}")
 
+    # Create random inputs mimicking what the diffusion modules would produce
     x_num    = torch.randn(B, n_num)
     x_cat_oh = torch.zeros(B, sum(cardinalities))
+    # Manually build valid one-hot vectors (one active index per feature)
     offset   = 0
     for K_i in cardinalities:
         idx = torch.randint(0, K_i, (B,))
@@ -294,8 +326,9 @@ if __name__ == "__main__":
     print(f"[mlp] eps_pred shape:    {eps_pred.shape}")
     print(f"[mlp] cat_logits shapes: {[l.shape for l in cat_logits]}")
 
+    # Also verify the indices_to_onehot utility
     x_cat_int = torch.stack([torch.randint(0, K, (B,)) for K in cardinalities], dim=1)
     x_cat_oh2 = indices_to_onehot(x_cat_int, cardinalities)
-    print(f"[mlp] indices_to_onehot: {x_cat_int.shape} → {x_cat_oh2.shape}")
+    print(f"[mlp] indices_to_onehot: {x_cat_int.shape} -> {x_cat_oh2.shape}")
 
-    print("[mlp] ✓ Sanity check passed.")
+    print("[mlp] Sanity check passed.")
